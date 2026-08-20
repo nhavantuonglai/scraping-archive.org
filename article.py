@@ -3,7 +3,7 @@ import re
 import sys
 import time
 import datetime
-from urllib.parse import urlparse
+import unicodedata
 
 try:
     import requests
@@ -11,39 +11,43 @@ except ImportError:
     print("Thiếu thư viện 'requests'. Vui lòng chạy: pip install requests")
     sys.exit(1)
 
+try:
+    from bs4 import BeautifulSoup, NavigableString
+except ImportError:
+    print("Thiếu thư viện 'beautifulsoup4'. Vui lòng chạy: pip install beautifulsoup4")
+    sys.exit(1)
 
-CDX_ENDPOINT = "https://web.archive.org/cdx/search/cdx"
+
+URL_PATTERN = re.compile(r'https?://\S+')
+SPECIAL_YAML_START = tuple('!&*?|>%@`"\'{}[],#')
 REQUEST_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                   '(KHTML, like Gecko) Chrome/124.0 Safari/537.36'
 }
 
-ARTICLE_PATH_PATTERN = re.compile(r'^/\d{4}/\d{2}/\d{2}/[^/]+/?$')
-EXCLUDE_KEYWORDS = (
-    '/tag/', '/category/', '/author/', '/feed', '/page/', '/wp-',
-    '/xmlrpc.php', '/comment-page-', '/embed', '/attachment/', '/trackback',
-    '/sitemap', '/wp-json',
-)
+FIXED_IMAGE = 'https://banmaixanh.vercel.app/image/cover/0001-0878.jpg'
+FIXED_WRITING = 'triet hoc duong pho'
+FIXED_AUTHOR = 'nguyen dan nguyen'
 
 
 def messages(msg_type, *args, return_string=False):
     messages_dict = {
-        "welcome": "Công cụ thu thập URL bài viết từ Wayback Machine (CDX Server API).",
-        "domain-prompt": "Nhập domain cần thu thập (ví dụ: triethocduongpho.com): ",
-        "domain-invalid": "Domain không hợp lệ. Nhập lại: ",
-        "from-prompt": "Nhập mốc thời gian bắt đầu, định dạng YYYYMMDD (mặc định 20150101): ",
-        "to-prompt": "Nhập mốc thời gian kết thúc, định dạng YYYYMMDD (Enter để dùng hôm nay): ",
-        "output-prompt": "Nhập đường dẫn tệp .txt để lưu danh sách URL (mặc định 'urls.txt'): ",
-        "counting-pages": "Đang xác định tổng số trang dữ liệu trên CDX Server…",
-        "pages-found": "Tổng số trang CDX cần tải: {0}.",
-        "fetch-page-error": "Lỗi tải trang {0}: {1}.",
-        "filtering": "Đang lọc URL bài viết…",
-        "result-summary": "Tổng capture thô: {0} | Sau lọc bài viết (mọi phiên bản): {1}.",
-        "saved": "Đã lưu {0} URL vào tệp: {1}.",
-        "no-result": "Không tìm thấy URL bài viết nào phù hợp trong khoảng thời gian đã chọn.",
+        "welcome": "Công cụ cào dữ liệu từ web.archive.org sang Markdown, chuẩn hóa YAML Frontmatter.",
+        "url-file-prompt": "Nhập đường dẫn tệp .txt chứa danh sách URL: ",
+        "url-file-invalid": "Tệp {0} không tồn tại. Nhập lại: ",
+        "url-file-empty": "Tệp {0} không chứa URL nào hợp lệ. Nhập lại: ",
+        "output-dir-prompt": "Nhập thư mục lưu kết quả (mặc định 'output'): ",
+        "processing": "Đang xử lý…",
+        "fetch-error": "Không tải được nội dung trang",
+        "no-article": "Không tìm thấy thẻ <article> hoặc nội dung rỗng",
+        "skip-shorter": "Nội dung ngắn hơn bản đã lưu, bỏ qua",
+        "overwrite-richer": "Nội dung dài hơn bản đã lưu, đã ghi đè: {0}",
+        "save-success": "Đã lưu: {0}",
+        "complete": "Tổng: {0} URL | Mới: {1} | Ghi đè (nội dung dài hơn): {2} | Bỏ qua (ngắn hơn): {3} | Thất bại: {4}.",
+        "output-path": "Kết quả được lưu tại thư mục: {0}.",
         "prompt-next": (
             "Chọn tiếp theo:\n"
-            "0: Thu thập domain khác.\n"
+            "0: Cào tệp URL khác.\n"
             "1: Thoát ứng dụng.\n"
             "Vui lòng chọn: "
         ),
@@ -54,48 +58,174 @@ def messages(msg_type, *args, return_string=False):
     print(message)
 
 
-def log(counter, total, label, status):
+def log(counter, total, url, status):
     ts = datetime.datetime.now().strftime("%Y%m%d %H%M%S")
-    print(f"{counter}/{total} | {ts} | {label} | {status}.")
+    print(f"{counter}/{total} | {ts} | {url} | {status}.")
 
 
-def normalize_domain(domain):
-    domain = domain.strip()
-    domain = re.sub(r'^https?://', '', domain, flags=re.IGNORECASE)
-    domain = domain.strip('/')
-    return domain
+def yaml_scalar(value):
+    value = (value or '').strip()
+    if value == '':
+        return ''
+    needs_quote = (
+        ':' in value
+        or value.startswith(SPECIAL_YAML_START)
+        or value.endswith(':')
+        or '\n' in value
+    )
+    if needs_quote:
+        escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+        return f'"{escaped}"'
+    return value
 
 
-def strip_query_and_fragment(url):
-    parsed = urlparse(url)
-    cleaned = parsed._replace(query='', fragment='')
-    return cleaned.geturl()
+def slugify(text):
+    text = (text or '').strip().lower()
+    text = text.replace('đ', 'd').replace('Đ', 'd')
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r'[^a-z0-9\s-]', '', text)
+    text = re.sub(r'[\s_-]+', '-', text).strip('-')
+    return text or 'untitled'
 
 
-def build_cdx_params(domain, date_from, date_to, page=None, show_num_pages=False):
-    params = {
-        'url': domain,
-        'matchType': 'domain',
-        'filter': ['statuscode:200', 'mimetype:text/html'],
-        'from': date_from,
-        'to': date_to,
-    }
-    if show_num_pages:
-        params['showNumPages'] = 'true'
-    else:
-        params['output'] = 'json'
-        params['fl'] = 'timestamp,original,statuscode,mimetype,length'
-        if page is not None:
-            params['page'] = page
-    return params
+def remove_diacritics_lower(text):
+    text = (text or '').strip().lower()
+    text = text.replace('đ', 'd')
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
-def request_with_retries(params, retries=3, timeout=60):
+def strip_urls(text):
+    return URL_PATTERN.sub('', text or '')
+
+
+def inline_to_md(node):
+    parts = []
+    for child in node.children:
+        if isinstance(child, NavigableString):
+            parts.append(str(child))
+            continue
+        name = child.name
+        if name == 'br':
+            parts.append('\n')
+        elif name in ('strong', 'b'):
+            inner = inline_to_md(child).strip()
+            if inner:
+                parts.append(f'**{inner}**')
+        elif name in ('em', 'i'):
+            inner = inline_to_md(child).strip()
+            if inner:
+                parts.append(f'*{inner}*')
+        elif name == 'a':
+            inner = inline_to_md(child).strip()
+            if inner:
+                parts.append(inner)
+        elif name == 'img':
+            continue
+        elif name == 'code':
+            inner = inline_to_md(child).strip()
+            if inner:
+                parts.append(f'`{inner}`')
+        elif name in ('script', 'style', 'iframe', 'noscript', 'ins', 'form'):
+            continue
+        else:
+            parts.append(inline_to_md(child))
+    return ''.join(parts)
+
+
+def table_to_md(table_node):
+    rows = table_node.find_all('tr', recursive=True)
+    if not rows:
+        return ''
+    md_rows = []
+    for i, row in enumerate(rows):
+        cells = row.find_all(['th', 'td'], recursive=False)
+        cell_texts = [inline_to_md(cell).strip().replace('\n', ' ') for cell in cells]
+        md_rows.append('| ' + ' | '.join(cell_texts) + ' |')
+        if i == 0:
+            md_rows.append('| ' + ' | '.join(['---'] * len(cells)) + ' |')
+    return '\n'.join(md_rows)
+
+
+def block_to_md(node):
+    parts = []
+    for child in node.children:
+        if isinstance(child, NavigableString):
+            text = str(child).strip()
+            if text:
+                parts.append(text)
+            continue
+
+        name = child.name
+
+        if name in ('script', 'style', 'iframe', 'noscript', 'ins', 'form'):
+            continue
+
+        elif name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+            level = int(name[1])
+            text = inline_to_md(child).strip()
+            if text:
+                parts.append(f"{'#' * level} {text}")
+
+        elif name == 'p':
+            text = inline_to_md(child).strip()
+            if text:
+                parts.append(text)
+
+        elif name == 'blockquote':
+            inner_md = block_to_md(child).strip()
+            if inner_md:
+                quoted_lines = [f'> {line}' if line else '>' for line in inner_md.split('\n')]
+                parts.append('\n'.join(quoted_lines))
+
+        elif name in ('ul', 'ol'):
+            items = []
+            counter = 1
+            for li in child.find_all('li', recursive=False):
+                text = inline_to_md(li).strip()
+                if not text:
+                    continue
+                if name == 'ul':
+                    items.append(f'- {text}')
+                else:
+                    items.append(f'{counter}. {text}')
+                    counter += 1
+            if items:
+                parts.append('\n'.join(items))
+
+        elif name == 'pre':
+            code_text = child.get_text()
+            parts.append(f'```\n{code_text.strip()}\n```')
+
+        elif name == 'img':
+            continue
+
+        elif name == 'hr':
+            parts.append('---')
+
+        elif name == 'table':
+            table_md = table_to_md(child)
+            if table_md:
+                parts.append(table_md)
+
+        else:
+            inner = block_to_md(child).strip()
+            if inner:
+                parts.append(inner)
+
+    return '\n\n'.join(p for p in parts if p)
+
+
+def fetch_html(url, retries=3, timeout=25):
     for attempt in range(1, retries + 1):
         try:
-            response = requests.get(CDX_ENDPOINT, params=params, headers=REQUEST_HEADERS, timeout=timeout)
+            response = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
             response.raise_for_status()
-            return response
+            response.encoding = response.apparent_encoding
+            return response.text
         except requests.RequestException:
             if attempt == retries:
                 return None
@@ -103,106 +233,177 @@ def request_with_retries(params, retries=3, timeout=60):
     return None
 
 
-def get_num_pages(domain, date_from, date_to):
-    params = build_cdx_params(domain, date_from, date_to, show_num_pages=True)
-    response = request_with_retries(params)
-    if response is None:
-        return 1
-    text = response.text.strip()
-    try:
-        return max(1, int(text))
-    except ValueError:
-        return 1
-
-
-def fetch_cdx_page(domain, date_from, date_to, page):
-    params = build_cdx_params(domain, date_from, date_to, page=page)
-    response = request_with_retries(params)
-    if response is None:
+def parse_article(html, url):
+    soup = BeautifulSoup(html, 'html.parser')
+    article = soup.find('article')
+    if article is None:
         return None
-    try:
-        data = response.json()
-    except ValueError:
-        return []
-    if not data or len(data) < 2:
-        return []
-    header = data[0]
-    return [dict(zip(header, row)) for row in data[1:]]
+
+    for junk in article.find_all(['script', 'style', 'iframe', 'noscript']):
+        junk.decompose()
+
+    title_tag = article.find('h1', class_='entry-title')
+    title = title_tag.get_text(strip=True) if title_tag else ''
+
+    time_tag = article.find('time', class_='entry-time')
+    pub_datetime = ''
+    if time_tag:
+        pub_datetime = (time_tag.get('datetime') or time_tag.get_text(strip=True) or '').strip()
+    if pub_datetime.endswith('+00:00'):
+        pub_datetime = pub_datetime[:-6] + 'Z'
+
+    tags = []
+    tags_tag = article.find(class_='entry-tags')
+    if tags_tag:
+        for a_tag in tags_tag.find_all('a'):
+            tag_text = a_tag.get_text(strip=True)
+            if tag_text and tag_text not in tags:
+                tags.append(tag_text)
+    if not tags:
+        for a_tag in article.find_all('a', attrs={'rel': 'tag'}):
+            tag_text = a_tag.get_text(strip=True)
+            if tag_text and tag_text not in tags:
+                tags.append(tag_text)
+    tags = [remove_diacritics_lower(tag) for tag in tags]
+
+    description = ''
+    meta_desc = soup.find('meta', attrs={'name': 'description'})
+    if meta_desc and meta_desc.get('content'):
+        description = meta_desc['content'].strip()
+    if not description:
+        meta_og_desc = soup.find('meta', attrs={'property': 'og:description'})
+        if meta_og_desc and meta_og_desc.get('content'):
+            description = meta_og_desc['content'].strip()
+
+    content_tag = article.find(class_='entry-content')
+    content_md = ''
+    if content_tag:
+        for junk in content_tag.find_all(['script', 'style', 'iframe', 'ins', 'form']):
+            junk.decompose()
+        for junk in content_tag.find_all(id='fb-root'):
+            junk.decompose()
+        content_md = block_to_md(content_tag).strip()
+    content_md = strip_urls(content_md)
+
+    return {
+        'url': url,
+        'title': title,
+        'pubDatetime': pub_datetime,
+        'author': FIXED_AUTHOR,
+        'writing': FIXED_WRITING,
+        'tags': tags,
+        'image': FIXED_IMAGE,
+        'description': description,
+        'content': content_md,
+    }
 
 
-def is_article_url(pure_url):
-    parsed = urlparse(pure_url)
-    lowered = parsed.path.lower()
-    if any(keyword in lowered for keyword in EXCLUDE_KEYWORDS):
-        return False
-    return bool(ARTICLE_PATH_PATTERN.match(parsed.path))
+def build_frontmatter(data):
+    lines = ['---']
+    lines.append(f"pubDatetime: {data['pubDatetime']}")
+    lines.append(f"title: {yaml_scalar(data['title'])}")
+    lines.append(f"description: {yaml_scalar(data['description'])}")
+    lines.append(f"image: {data['image']}")
+    if data['tags']:
+        lines.append('tags:')
+        for tag in data['tags']:
+            lines.append(f'  - {yaml_scalar(tag)}')
+    else:
+        lines.append('tags: []')
+    lines.append(f"writing: {yaml_scalar(data.get('writing', ''))}")
+    lines.append(f"author: {yaml_scalar(data['author'])}")
+    lines.append('---')
+    return '\n'.join(lines)
 
 
-def dedupe_exact(records):
-    seen = set()
-    unique_records = []
-    for record in records:
-        key = (record['timestamp'], record['original'])
-        if key in seen:
+def build_output_path(title, output_dir):
+    filename = slugify(title) + '.md'
+    return os.path.join(output_dir, filename)
+
+
+def read_existing_body_length(filepath):
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+    match = re.match(r'^---\n.*?\n---\n\n?', content, re.DOTALL)
+    body = content[match.end():] if match else content
+    return len(body.strip())
+
+
+def save_markdown(data, filepath):
+    frontmatter = build_frontmatter(data)
+    body = data['content'].strip()
+    full_md = f"{frontmatter}\n\n{body}\n"
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(full_md)
+    return filepath
+
+
+def read_urls(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        urls = [line.strip() for line in f if line.strip()]
+    return urls
+
+
+def process_urls(urls, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    total = len(urls)
+    saved = 0
+    overwritten = 0
+    skipped = 0
+    failed = 0
+
+    for index, url in enumerate(urls, start=1):
+        html = fetch_html(url)
+        if not html:
+            failed += 1
+            log(index, total, url, messages("fetch-error", return_string=True))
             continue
-        seen.add(key)
-        unique_records.append(record)
-    return unique_records
 
-
-def build_wayback_url(record):
-    return f"https://web.archive.org/web/{record['timestamp']}/{record['original']}"
-
-
-def collect_urls(domain, date_from, date_to):
-    messages("counting-pages")
-    total_pages = get_num_pages(domain, date_from, date_to)
-    messages("pages-found", total_pages)
-
-    all_records = []
-    for page in range(total_pages):
-        log(page + 1, total_pages, f"page={page}", "đang tải")
-        records = fetch_cdx_page(domain, date_from, date_to, page)
-        if records is None:
-            log(page + 1, total_pages, f"page={page}", "thất bại")
+        data = parse_article(html, url)
+        if not data or not data['content']:
+            failed += 1
+            log(index, total, url, messages("no-article", return_string=True))
             continue
-        all_records.extend(records)
-        time.sleep(0.5)
 
-    messages("filtering")
-    for record in all_records:
-        record['original'] = strip_query_and_fragment(record['original'])
+        filepath = build_output_path(data['title'], output_dir)
+        new_size = len(data['content'].strip())
 
-    article_records = [r for r in all_records if is_article_url(r['original'])]
-    article_records = dedupe_exact(article_records)
-    article_records.sort(key=lambda r: (r['original'], r['timestamp']))
+        if os.path.exists(filepath):
+            existing_size = read_existing_body_length(filepath)
+            if new_size <= existing_size:
+                skipped += 1
+                log(index, total, url, messages("skip-shorter", return_string=True))
+                continue
+            save_markdown(data, filepath)
+            overwritten += 1
+            log(index, total, url, messages("overwrite-richer", filepath, return_string=True))
+            continue
 
-    messages("result-summary", len(all_records), len(article_records))
-    return article_records
+        save_markdown(data, filepath)
+        saved += 1
+        log(index, total, url, messages("save-success", filepath, return_string=True))
 
-
-def save_urls(records, output_path):
-    with open(output_path, 'w', encoding='utf-8') as f:
-        for record in records:
-            f.write(build_wayback_url(record) + '\n')
-
-
-def get_domain():
-    domain = input(messages("domain-prompt", return_string=True)).strip()
-    while not domain:
-        domain = input(messages("domain-invalid", return_string=True)).strip()
-    return normalize_domain(domain)
+    return total, saved, overwritten, skipped, failed
 
 
-def get_date_range():
-    date_from = input(messages("from-prompt", return_string=True)).strip() or "20150101"
-    date_to = input(messages("to-prompt", return_string=True)).strip() or datetime.datetime.now().strftime("%Y%m%d")
-    return date_from, date_to
+def get_url_file():
+    file_path = input(messages("url-file-prompt", return_string=True)).strip().strip('"')
+    while not os.path.isfile(file_path):
+        file_path = input(messages("url-file-invalid", file_path, return_string=True)).strip().strip('"')
+
+    urls = read_urls(file_path)
+    while not urls:
+        file_path = input(messages("url-file-empty", file_path, return_string=True)).strip().strip('"')
+        while not os.path.isfile(file_path):
+            file_path = input(messages("url-file-invalid", file_path, return_string=True)).strip().strip('"')
+        urls = read_urls(file_path)
+
+    return urls
 
 
-def get_output_path():
-    output_path = input(messages("output-prompt", return_string=True)).strip().strip('"')
-    return output_path or "urls.txt"
+def get_output_dir():
+    output_dir = input(messages("output-dir-prompt", return_string=True)).strip().strip('"')
+    return output_dir or "output"
 
 
 def main():
@@ -210,16 +411,14 @@ def main():
         try:
             messages("welcome")
 
-            domain = get_domain()
-            date_from, date_to = get_date_range()
-            output_path = get_output_path()
+            urls = get_url_file()
+            output_dir = get_output_dir()
 
-            records = collect_urls(domain, date_from, date_to)
-            if not records:
-                messages("no-result")
-            else:
-                save_urls(records, output_path)
-                messages("saved", len(records), os.path.abspath(output_path))
+            messages("processing")
+            total, saved, overwritten, skipped, failed = process_urls(urls, output_dir)
+
+            messages("complete", total, saved, overwritten, skipped, failed)
+            print(messages("output-path", os.path.abspath(output_dir), return_string=True))
 
             next_choice = input(messages("prompt-next", return_string=True)).strip()
             if next_choice == "1":
