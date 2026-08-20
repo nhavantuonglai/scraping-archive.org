@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import datetime
 import unicodedata
 
 try:
@@ -27,6 +28,38 @@ REQUEST_HEADERS = {
 FIXED_IMAGE = 'https://banmaixanh.vercel.app/image/cover/0001-0878.jpg'
 FIXED_WRITING = 'triet hoc duong pho'
 FIXED_AUTHOR = 'nguyen dan nguyen'
+
+
+def messages(msg_type, *args, return_string=False):
+    messages_dict = {
+        "welcome": "Công cụ cào dữ liệu từ web.archive.org sang Markdown, chuẩn hóa YAML Frontmatter.",
+        "url-file-prompt": "Nhập đường dẫn tệp .txt chứa danh sách URL: ",
+        "url-file-invalid": "Tệp {0} không tồn tại. Nhập lại: ",
+        "url-file-empty": "Tệp {0} không chứa URL nào hợp lệ. Nhập lại: ",
+        "output-dir-prompt": "Nhập thư mục lưu kết quả (mặc định 'output'): ",
+        "processing": "Đang xử lý…",
+        "fetch-error": "Không tải được nội dung trang",
+        "no-article": "Không tìm thấy thẻ <article> hoặc nội dung rỗng",
+        "skip-exist": "Đã tồn tại, bỏ qua",
+        "save-success": "Đã lưu: {0}",
+        "complete": "Tổng: {0} URL | Thành công: {1} | Bỏ qua: {2} | Thất bại: {3}.",
+        "output-path": "Kết quả được lưu tại thư mục: {0}.",
+        "prompt-next": (
+            "Chọn tiếp theo:\n"
+            "0: Cào tệp URL khác.\n"
+            "1: Thoát ứng dụng.\n"
+            "Vui lòng chọn: "
+        ),
+    }
+    message = messages_dict.get(msg_type, "").format(*args)
+    if return_string:
+        return message
+    print(message)
+
+
+def log(counter, total, url, status):
+    ts = datetime.datetime.now().strftime("%Y%m%d %H%M%S")
+    print(f"{counter}/{total} | {ts} | {url} | {status}.")
 
 
 def yaml_scalar(value):
@@ -192,9 +225,8 @@ def fetch_html(url, retries=3, timeout=25):
             response.raise_for_status()
             response.encoding = response.apparent_encoding
             return response.text
-        except requests.RequestException as exc:
+        except requests.RequestException:
             if attempt == retries:
-                print(f'    Lỗi tải trang sau {retries} lần thử: {exc}')
                 return None
             time.sleep(2 * attempt)
     return None
@@ -283,28 +315,18 @@ def build_frontmatter(data):
     return '\n'.join(lines)
 
 
-def save_markdown(data, output_dir):
+def build_output_path(title, output_dir):
+    filename = slugify(title) + '.md'
+    return os.path.join(output_dir, filename)
+
+
+def save_markdown(data, filepath):
     frontmatter = build_frontmatter(data)
-    full_md = f"{frontmatter}\n\n{data['content']}\n"
-    filename = slugify(data['title']) + '.md'
-    filepath = os.path.join(output_dir, filename)
-    base, ext = os.path.splitext(filepath)
-    counter = 1
-    while os.path.exists(filepath):
-        filepath = f'{base}-{counter}{ext}'
-        counter += 1
+    body = data['content'].strip()
+    full_md = f"{frontmatter}\n\n{body}\n"
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(full_md)
     return filepath
-
-
-def print_banner():
-    print('=' * 64)
-    print('   CÔNG CỤ CÀO DỮ LIỆU TỪ WEB.ARCHIVE.ORG SANG MARKDOWN')
-    print('=' * 64)
-    print('Đọc danh sách URL trên Wayback Machine, trích xuất nội dung')
-    print('bài viết trong tệp <article> và xuất ra các tệp .md chuẩn hóa')
-    print('kèm khối YAML Frontmatter.\n')
 
 
 def read_urls(file_path):
@@ -315,61 +337,78 @@ def read_urls(file_path):
 
 def process_urls(urls, output_dir):
     os.makedirs(output_dir, exist_ok=True)
-    success_count = 0
-    fail_count = 0
     total = len(urls)
+    success = 0
+    skipped = 0
+    failed = 0
 
     for index, url in enumerate(urls, start=1):
-        print(f'[{index}/{total}] Đang xử lý: {url}')
         html = fetch_html(url)
         if not html:
-            fail_count += 1
-            print('    -> Thất bại: không tải được nội dung trang.\n')
+            failed += 1
+            log(index, total, url, messages("fetch-error", return_string=True))
             continue
 
         data = parse_article(html, url)
         if not data or not data['content']:
-            fail_count += 1
-            print('    -> Thất bại: không tìm thấy <article> hoặc nội dung rỗng.\n')
+            failed += 1
+            log(index, total, url, messages("no-article", return_string=True))
             continue
 
-        filepath = save_markdown(data, output_dir)
-        success_count += 1
-        print(f'    -> Thành công: {filepath}\n')
+        filepath = build_output_path(data['title'], output_dir)
+        if os.path.exists(filepath):
+            skipped += 1
+            log(index, total, url, messages("skip-exist", return_string=True))
+            continue
 
-    return success_count, fail_count, total
+        save_markdown(data, filepath)
+        success += 1
+        log(index, total, url, messages("save-success", filepath, return_string=True))
+
+    return total, success, skipped, failed
+
+
+def get_url_file():
+    file_path = input(messages("url-file-prompt", return_string=True)).strip().strip('"')
+    while not os.path.isfile(file_path):
+        file_path = input(messages("url-file-invalid", file_path, return_string=True)).strip().strip('"')
+
+    urls = read_urls(file_path)
+    while not urls:
+        file_path = input(messages("url-file-empty", file_path, return_string=True)).strip().strip('"')
+        while not os.path.isfile(file_path):
+            file_path = input(messages("url-file-invalid", file_path, return_string=True)).strip().strip('"')
+        urls = read_urls(file_path)
+
+    return urls
+
+
+def get_output_dir():
+    output_dir = input(messages("output-dir-prompt", return_string=True)).strip().strip('"')
+    return output_dir or "output"
 
 
 def main():
-    print_banner()
     while True:
-        file_path = input('Nhập đường dẫn tệp .txt chứa danh sách URL: ').strip().strip('"')
-        if not os.path.isfile(file_path):
-            print(f'Không tìm thấy tệp: {file_path}\n')
-            continue
+        try:
+            messages("welcome")
 
-        urls = read_urls(file_path)
-        if not urls:
-            print('Tệp không chứa URL nào hợp lệ.\n')
-            continue
+            urls = get_url_file()
+            output_dir = get_output_dir()
 
-        output_dir = input('Nhập thư mục lưu kết quả (Enter để dùng "output"): ').strip().strip('"')
-        if not output_dir:
-            output_dir = 'output'
+            messages("processing")
+            total, success, skipped, failed = process_urls(urls, output_dir)
 
-        print(f'\nBắt đầu xử lý {len(urls)} URL...\n')
-        success, fail, total = process_urls(urls, output_dir)
+            messages("complete", total, success, skipped, failed)
+            print(messages("output-path", os.path.abspath(output_dir), return_string=True))
 
-        print('=' * 64)
-        print(f'HOÀN TẤT: {success}/{total} thành công, {fail}/{total} thất bại.')
-        print(f'Kết quả được lưu tại thư mục: {os.path.abspath(output_dir)}')
-        print('=' * 64)
+            next_choice = input(messages("prompt-next", return_string=True)).strip()
+            if next_choice == "1":
+                sys.exit(0)
 
-        again = input('\nBạn có muốn cào tệp URL khác không? (y/n): ').strip().lower()
-        if again != 'y':
-            print('\nCảm ơn bạn đã sử dụng công cụ. Tạm biệt!')
-            break
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(0)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
