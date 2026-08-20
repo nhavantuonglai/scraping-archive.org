@@ -37,6 +37,8 @@ def messages(msg_type, *args, return_string=False):
         "counting-pages": "Đang xác định tổng số trang dữ liệu trên CDX Server…",
         "pages-found": "Tổng số trang CDX cần tải: {0}.",
         "fetch-page-error": "Lỗi tải trang {0}: {1}.",
+        "retry-round": "Vòng thử lại {0}: còn {1} trang chưa tải được.",
+        "pages-failed-final": "CẢNH BÁO: {0} trang vẫn thất bại sau {1} vòng thử, dữ liệu các trang này bị thiếu: {2}.",
         "filtering": "Đang lọc URL bài viết…",
         "result-summary": "Tổng capture thô: {0} | Sau lọc bài viết (mọi phiên bản): {1}.",
         "saved": "Đã lưu {0} URL vào tệp: {1}.",
@@ -90,7 +92,7 @@ def build_cdx_params(domain, date_from, date_to, page=None, show_num_pages=False
     return params
 
 
-def request_with_retries(params, retries=3, timeout=60):
+def request_with_retries(params, retries=4, timeout=90):
     for attempt in range(1, retries + 1):
         try:
             response = requests.get(CDX_ENDPOINT, params=params, headers=REQUEST_HEADERS, timeout=timeout)
@@ -99,7 +101,7 @@ def request_with_retries(params, retries=3, timeout=60):
         except requests.RequestException:
             if attempt == retries:
                 return None
-            time.sleep(2 * attempt)
+            time.sleep(3 * attempt)
     return None
 
 
@@ -154,20 +156,42 @@ def build_wayback_url(record):
     return f"https://web.archive.org/web/{record['timestamp']}/{record['original']}"
 
 
+def fetch_all_pages(domain, date_from, date_to, total_pages, max_rounds=5):
+    all_records = []
+    pending_pages = list(range(total_pages))
+    round_number = 1
+
+    while pending_pages and round_number <= max_rounds:
+        still_pending = []
+        for page in pending_pages:
+            label = f"page={page} (vòng {round_number})"
+            log(page + 1, total_pages, label, "đang tải")
+            records = fetch_cdx_page(domain, date_from, date_to, page)
+            if records is None:
+                log(page + 1, total_pages, label, "thất bại")
+                still_pending.append(page)
+                continue
+            all_records.extend(records)
+            time.sleep(0.5)
+
+        pending_pages = still_pending
+        if pending_pages:
+            messages("retry-round", round_number, len(pending_pages))
+            time.sleep(5)
+        round_number += 1
+
+    return all_records, pending_pages
+
+
 def collect_urls(domain, date_from, date_to):
     messages("counting-pages")
     total_pages = get_num_pages(domain, date_from, date_to)
     messages("pages-found", total_pages)
 
-    all_records = []
-    for page in range(total_pages):
-        log(page + 1, total_pages, f"page={page}", "đang tải")
-        records = fetch_cdx_page(domain, date_from, date_to, page)
-        if records is None:
-            log(page + 1, total_pages, f"page={page}", "thất bại")
-            continue
-        all_records.extend(records)
-        time.sleep(0.5)
+    all_records, failed_pages = fetch_all_pages(domain, date_from, date_to, total_pages)
+
+    if failed_pages:
+        messages("pages-failed-final", len(failed_pages), 5, ', '.join(str(p) for p in failed_pages))
 
     messages("filtering")
     for record in all_records:
@@ -178,7 +202,7 @@ def collect_urls(domain, date_from, date_to):
     article_records.sort(key=lambda r: (r['original'], r['timestamp']))
 
     messages("result-summary", len(all_records), len(article_records))
-    return article_records
+    return article_records, failed_pages
 
 
 def save_urls(records, output_path):
@@ -214,12 +238,17 @@ def main():
             date_from, date_to = get_date_range()
             output_path = get_output_path()
 
-            records = collect_urls(domain, date_from, date_to)
+            records, failed_pages = collect_urls(domain, date_from, date_to)
             if not records:
                 messages("no-result")
             else:
                 save_urls(records, output_path)
                 messages("saved", len(records), os.path.abspath(output_path))
+                if failed_pages:
+                    print(messages(
+                        "pages-failed-final", len(failed_pages), 5,
+                        ', '.join(str(p) for p in failed_pages), return_string=True
+                    ))
 
             next_choice = input(messages("prompt-next", return_string=True)).strip()
             if next_choice == "1":
